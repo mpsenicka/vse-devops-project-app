@@ -1,8 +1,8 @@
 name: Build and tests eshop
 
 on:
+  pull_request:
   workflow_dispatch:
-  push:
 
 jobs:
   Install:
