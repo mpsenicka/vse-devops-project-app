@@ -1,0 +1,125 @@
+- name: Deploy to AWS EC2
+  hosts: localhost
+  connection: local
+
+  tasks:
+    - name: Launch EC2 Instance
+      ec2_instance:
+        instance_type: t3.medium
+        tags:
+          Name: 'Eshop-production'
+          Created: '{{ ansible_date_time.epoch }}'
+        image_id: ami-0230bd60aa48260c6
+        region: us-east-1
+        key_name: ansible
+        vpc_subnet_id: subnet-050645452ca6781b5
+        count: 1
+        network:
+          assign_public_ip: yes
+        wait: yes
+        security_group: eshop
+        aws_access_key: '{{ access_key }}'
+        aws_secret_key: '{{ secret_key }}'
+        security_token: '{{ session_token }}'
+      register: ec2_instance_result
+
+    - name: Add EC2 Instance host to security_group
+      add_host:
+        hostname: '{{ item.public_ip_address }}'
+        groupname: launched
+      loop: '{{ ec2_instance_result.instances }}'
+
+    - name: Wait for SSH connection
+      delegate_to: '{{ item.public_dns_name }}'
+      wait_for_connection:
+        delay: 30
+        timeout: 300
+      loop: '{{ ec2_instance_result.instances }}'
+
+- name: Configure EC2 Instance
+  hosts: launched
+  connection: ssh
+  become: yes
+  vars:
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+  tasks:
+    - name: Install Git and Docker
+      yum:
+        name:
+          - git
+          - docker
+        state: latest
+        update_cache: yes
+
+    - service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Set access rights to Docker
+      shell: usermod -a -G docker ec2-user
+
+    - name: Fetch eshop from Git
+      git:
+        repo: 'https://github.com/mpsenicka/vse-devops-project-app.git'
+        dest: ./app
+
+    - name: Build Eshop Docker image
+      docker_image:
+        build:
+          path: ./app
+        name: eshop
+        tag: latest
+        source: build
+    - name: Run Eshop Docker
+      docker_container:
+        name: eshop
+        image: eshop
+        state: started
+        ports:
+          - '80:3000'
+
+    - name: Wait for eshop to run
+      wait_for:
+        port: 80
+
+- name: Terminate Previous EC2 Instance
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  tasks:
+    - name: Find all instances by Tag
+      ec2_instance_info:
+        filters:
+          'tag:Name': 'Eshop-production'
+          'instance-state-name': 'running'
+        region: us-east-1
+        aws_access_key: '{{ access_key }}'
+        aws_secret_key: '{{ secret_key }}'
+        security_token: '{{ session_token }}'
+      register: all_instances
+
+    - name: List & Sort all production Instances
+      set_fact:
+        instances_list: "{{ all_instances.instances | sort(attribute='launch_time', reverse=true) | map(attribute='instance_id') }}"
+      when: all_instances.instances | length > 0
+
+    - name: Exclude the newly created Instance
+      set_fact:
+        instances_to_terminate: '{{ instances_to_terminate + [item] }}'
+      loop: '{{ instances_list[1:] }}'
+      vars:
+        instances_to_terminate: []
+      when: instances_list | length > 0
+
+    - name: Terminate previous production Instances
+      ec2_instance:
+        state: 'absent'
+        instance_ids: '{{ instances_to_terminate }}'
+        aws_access_key: '{{ access_key }}'
+        aws_secret_key: '{{ secret_key }}'
+        security_token: '{{ session_token }}'
+        region: us-east-1
+      when: instances_to_terminate and instances_to_terminate | length > 0
